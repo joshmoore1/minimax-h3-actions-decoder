@@ -1,0 +1,7 @@
+safetensors>=0.4.0
+av>=12.0.0
+numpy
+Pillow
+accelerate
+psutil
+git+https://github.com/huggingface/diffusers.git@665f578278365ea4a3318cb8c9b66ce6c01204b9
