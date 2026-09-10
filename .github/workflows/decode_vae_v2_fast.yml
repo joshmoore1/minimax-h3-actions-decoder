@@ -1,4 +1,4 @@
-name: MiniMax-H3 VAE Decoder
+name: MiniMax-H3 VAE Decoder (Fast BF16 + Live Heartbeat)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,15 @@ on:
       output_name:
         description: "Name for the output MP4 video"
         required: true
-        default: "fox_decoded.mp4"
+        default: "fox_decoded_bf16.mp4"
+      dtype:
+        description: "Precision (bfloat16 uses AVX-512 hardware acceleration; float32 is legacy fallback)"
+        required: true
+        default: "bfloat16"
+        type: choice
+        options:
+          - "bfloat16"
+          - "float32"
       enable_tiling:
         description: "Enable spatial tiling (caps RAM overhead)"
         type: boolean
@@ -21,8 +29,8 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
-  decode:
-    name: CPU VAE Decode
+  decode_fast:
+    name: Fast BF16 CPU VAE Decode
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -36,8 +44,6 @@ jobs:
           lscpu | grep -E "Model name|CPU\(s\):|Thread|Core"
           echo "=== Initial Memory ==="
           free -h
-          echo "=== Disk Space ==="
-          df -h /
           
           echo "=== Allocating Additional 8GB Swap ==="
           sudo fallocate -l 8G /swapfile2 || sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192
@@ -45,7 +51,7 @@ jobs:
           sudo mkswap /swapfile2
           sudo swapon /swapfile2
           
-          echo "=== System Memory with Additional Swap ==="
+          echo "=== Memory with Swap ==="
           free -h
 
       - name: Install System Dependencies
@@ -65,7 +71,7 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Run MiniMax-H3 VAE Decode
+      - name: Run MiniMax-H3 VAE Decode (BF16 + Live Heartbeat)
         run: |
           TILE_FLAG=""
           if [ "${{ inputs.enable_tiling }}" = "false" ]; then
@@ -73,7 +79,7 @@ jobs:
           fi
           python decode_minimax_h3.py "${{ inputs.latent_file }}" \
             --device cpu \
-            --dtype float32 \
+            --dtype "${{ inputs.dtype }}" \
             --output "${{ inputs.output_name }}" \
             $TILE_FLAG
 
