@@ -1,4 +1,4 @@
-name: MiniMax-H3 VAE Decoder (Fast BF16 + Live Heartbeat)
+name: MiniMax-H3 VAE Decoder (Fast BF16 + Live Progress)
 
 on:
   workflow_dispatch:
@@ -12,18 +12,23 @@ on:
         required: true
         default: "fox_decoded_bf16.mp4"
       dtype:
-        description: "Precision (bfloat16 uses AVX-512 hardware acceleration; float32 is legacy fallback)"
+        description: "Precision (bfloat16 uses AVX-512 hardware acceleration; float32 is legacy)"
         required: true
         default: "bfloat16"
         type: choice
         options:
           - "bfloat16"
           - "float32"
-      enable_tiling:
-        description: "Enable spatial tiling (caps RAM overhead)"
-        type: boolean
+      tile_config:
+        description: "Tiling Strategy (Fast 512x512 = ~2 tiles; Single 544x960 = 1 tile; Default 256x256 = ~15 tiles)"
         required: true
-        default: true
+        default: "fast_512"
+        type: choice
+        options:
+          - "fast_512"
+          - "single_tile"
+          - "default_256"
+          - "no_tile"
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -71,17 +76,22 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Run MiniMax-H3 VAE Decode (BF16 + Live Heartbeat)
+      - name: Run MiniMax-H3 VAE Decode (BF16 + Live Progress)
         run: |
-          TILE_FLAG=""
-          if [ "${{ inputs.enable_tiling }}" = "false" ]; then
-            TILE_FLAG="--no-tile"
+          TILE_ARGS=""
+          if [ "${{ inputs.tile_config }}" = "fast_512" ]; then
+            TILE_ARGS="--tile-size 512 512"
+          elif [ "${{ inputs.tile_config }}" = "single_tile" ]; then
+            TILE_ARGS="--tile-size 544 960"
+          elif [ "${{ inputs.tile_config }}" = "no_tile" ]; then
+            TILE_ARGS="--no-tile"
           fi
+          
           python decode_minimax_h3.py "${{ inputs.latent_file }}" \
             --device cpu \
             --dtype "${{ inputs.dtype }}" \
             --output "${{ inputs.output_name }}" \
-            $TILE_FLAG
+            $TILE_ARGS
 
       - name: Upload Decoded MP4 Artifact
         uses: actions/upload-artifact@v4

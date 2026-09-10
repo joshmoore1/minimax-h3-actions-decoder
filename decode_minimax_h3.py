@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Standalone MiniMax-H3 CPU/GPU VAE Decoder for GitHub Actions & Local Execution (v2).
+Standalone MiniMax-H3 CPU/GPU VAE Decoder for GitHub Actions & Local Execution (v3).
 
 Features:
 - Auto-detects CPU / CUDA.
-- Supports float32, bfloat16, or float16.
-- Background Heartbeat Thread: logs live memory RSS, swap, and elapsed seconds every 15s during decode.
-- Spatial tiling support via --tile.
-- Combines decoded video frames with stereo audio into a final H.264 MP4.
+- Precision: bfloat16 (hardware AVX-512 accelerated on Zen 4), float16, or float32.
+- Granular Progress Tracking: PyTorch forward hooks on all 36 ViT decoder blocks
+  reporting step count, block index, speed (s/block), and ETA.
+- Configurable Spatial Tiling: supports custom tile sizes (e.g. 512x512 or 544x960)
+  to avoid redundant sub-tile passes.
+- Background Memory Heartbeat thread for system health monitoring.
+- PyAV audio/video muxing into H.264 MP4.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from diffusers.utils import encode_video
 
 
 class MemoryHeartbeat(threading.Thread):
-    def __init__(self, interval_sec: float = 15.0):
+    def __init__(self, interval_sec: float = 30.0):
         super().__init__(daemon=True)
         self.interval = interval_sec
         self.stop_event = threading.Event()
@@ -47,12 +50,58 @@ class MemoryHeartbeat(threading.Thread):
             swap_mb = swap.used / (1024 * 1024)
             print(
                 f"[heartbeat] Elapsed: {elapsed:5.1f}s | Process RSS: {rss_mb:6.1f} MB | "
-                f"System RAM: {used_gb:4.1f}/{total_gb:.1f} GB ({vm.percent}%) | Swap: {swap_mb:5.1f} MB",
+                f"RAM: {used_gb:4.1f}/{total_gb:.1f} GB ({vm.percent}%) | Swap: {swap_mb:5.1f} MB",
                 flush=True,
             )
 
     def stop(self):
         self.stop_event.set()
+
+
+class VAEProgressTracker:
+    def __init__(self, vae, num_blocks: int = 36, expected_tiles: int = 1):
+        self.num_blocks = num_blocks
+        self.expected_tiles = expected_tiles
+        self.total_expected_steps = num_blocks * expected_tiles
+        self.current_step = 0
+        self.start_time = None
+        self.hooks = []
+        self.proc = psutil.Process()
+
+        # Register forward hook on each transformer block of the ViT decoder
+        for idx, block in enumerate(vae.decoder.transformer_blocks):
+            hook = block.register_forward_hook(self._make_hook(idx))
+            self.hooks.append(hook)
+
+    def _make_hook(self, block_idx: int):
+        def hook_fn(module, input, output):
+            if self.start_time is None:
+                self.start_time = time.time()
+            self.current_step += 1
+            elapsed = time.time() - self.start_time
+            rate = elapsed / self.current_step
+            
+            # If total_expected_steps was an underestimate due to tiling, update dynamically
+            if self.current_step > self.total_expected_steps:
+                self.total_expected_steps = self.current_step + self.num_blocks
+
+            pct = (self.current_step / self.total_expected_steps) * 100.0
+            eta_sec = (self.total_expected_steps - self.current_step) * rate
+            eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60):02d}s" if eta_sec >= 0 else "finishing"
+            rss_mb = self.proc.memory_info().rss / (1024 * 1024)
+
+            print(
+                f"[PROGRESS] Step {self.current_step:3d}/{self.total_expected_steps:3d} "
+                f"({pct:5.1f}%) | Layer {block_idx+1:2d}/36 | "
+                f"Elapsed: {int(elapsed//60)}m {int(elapsed%60):02d}s | ETA: {eta_str} "
+                f"({rate:4.2f}s/layer) | RSS: {rss_mb:.0f} MB",
+                flush=True,
+            )
+        return hook_fn
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
 
 
 def print_memory_diagnostics(stage: str):
@@ -76,6 +125,7 @@ def decode_latents(
     device: str | None = None,
     dtype: str = "bfloat16",
     tile: bool = True,
+    tile_size: tuple[int, int] | None = None,
 ) -> str:
     start_total = time.time()
     print_memory_diagnostics("start")
@@ -136,16 +186,38 @@ def decode_latents(
     print(f"[decoder] VAE loaded in {time.time() - t0:.2f}s", flush=True)
     print_memory_diagnostics("vae_loaded")
 
-    if tile:
-        print("[decoder] Spatial tiling ENABLED (low memory mode)", flush=True)
+    # Configure tiling
+    expected_tiles = 1
+    if not tile:
+        print("[decoder] Spatial tiling DISABLED (single monolithic pass)", flush=True)
+        vae.disable_tiling()
+    elif tile_size is not None:
+        th, tw = tile_size
+        print(f"[decoder] Configuring spatial tiling with custom tile size {tw}x{th} ...", flush=True)
+        vae.enable_tiling(tile_sample_min_height=th, tile_sample_min_width=tw)
+        # Estimate tile count
+        ny = max(1, (height + th - 1) // th)
+        nx = max(1, (width + tw - 1) // tw)
+        expected_tiles = ny * nx
+        print(f"[decoder] Estimated spatial tiles: {expected_tiles} ({nx} horizontal x {ny} vertical)", flush=True)
+    else:
+        print("[decoder] Spatial tiling ENABLED (default diffusers 256x256 tile size)", flush=True)
         vae.enable_tiling()
+        ny = max(1, (height + 256 - 64 - 1) // (256 - 64))
+        nx = max(1, (width + 256 - 64 - 1) // (256 - 64))
+        expected_tiles = ny * nx
+        print(f"[decoder] Estimated spatial tiles: {expected_tiles} ({nx} horizontal x {ny} vertical)", flush=True)
+
+    # Register real-time forward hook tracker
+    tracker = VAEProgressTracker(vae, num_blocks=len(vae.decoder.transformer_blocks), expected_tiles=expected_tiles)
+    heartbeat = MemoryHeartbeat(interval_sec=30.0)
+    heartbeat.start()
 
     # Denormalize latents
-    print("[decoder] Starting VAE decoding computation (heartbeat active) ...", flush=True)
+    print("=" * 65, flush=True)
+    print(f"[decoder] Starting decode: 36 layers x {expected_tiles} tiles = ~{tracker.total_expected_steps} total layer evaluations", flush=True)
+    print("=" * 65, flush=True)
     t_decode = time.time()
-    
-    heartbeat = MemoryHeartbeat(interval_sec=15.0)
-    heartbeat.start()
 
     try:
         with torch.no_grad():
@@ -161,9 +233,11 @@ def decode_latents(
             pixel_std = torch.tensor((0.229, 0.224, 0.225), device=torch_device, dtype=torch.float32).view(1, -1, 1, 1, 1)
             video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
     finally:
+        tracker.remove()
         heartbeat.stop()
 
     decode_duration = time.time() - t_decode
+    print("=" * 65, flush=True)
     print(f"[decoder] Decoded video tensor: {video.shape} in {decode_duration:.2f}s ({decode_duration/60:.2f} min)", flush=True)
     print_memory_diagnostics("decoded")
 
@@ -195,10 +269,10 @@ def decode_latents(
     total_duration = time.time() - start_total
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print_memory_diagnostics("finished")
-    print("=" * 60, flush=True)
-    print(f"[decoder] SUCCESS! Video saved to: {output_path} ({file_size_mb:.2f} MB)", flush=True)
-    print(f"[decoder] Decode Time: {decode_duration:.2f}s ({decode_duration/60:.2f} min) | Total Elapsed: {total_duration:.2f}s", flush=True)
-    print("=" * 60, flush=True)
+    print("=" * 65, flush=True)
+    print(f"[decoder] SUCCESS! Video saved to: {output_path} ({file_size_mb:.2f} MB)")
+    print(f"[decoder] Decode Time: {decode_duration:.2f}s ({decode_duration/60:.2f} min) | Total Elapsed: {total_duration:.2f}s ({total_duration/60:.2f} min)")
+    print("=" * 65, flush=True)
     return output_path
 
 
@@ -210,8 +284,10 @@ def main():
     parser.add_argument("--device", default=None, help="Device to use (cuda or cpu)")
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"], help="Precision")
     parser.add_argument("--no-tile", action="store_true", help="Disable spatial tiling")
+    parser.add_argument("--tile-size", nargs=2, type=int, default=None, metavar=("HEIGHT", "WIDTH"), help="Custom tile size (e.g. 512 512 or 544 960)")
 
     args = parser.parse_args()
+    tile_size = tuple(args.tile_size) if args.tile_size is not None else None
     decode_latents(
         latent_path=args.latent_path,
         vae_path=args.vae_path,
@@ -219,6 +295,7 @@ def main():
         device=args.device,
         dtype=args.dtype,
         tile=not args.no_tile,
+        tile_size=tile_size,
     )
 
 
