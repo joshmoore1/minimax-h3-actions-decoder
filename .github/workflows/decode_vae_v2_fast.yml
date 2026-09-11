@@ -1,4 +1,4 @@
-name: MiniMax-H3 VAE Decoder (Fast BF16 + Live Progress)
+name: MiniMax-H3 VAE Decoder (Fast Float32 + Live Progress)
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ env:
 
 jobs:
   decode_fast:
-    name: Fast BF16 CPU VAE Decode
+    name: Fast Float32 CPU VAE Decode
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -76,7 +76,7 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Run MiniMax-H3 VAE Decode (BF16 + Live Progress)
+      - name: Run MiniMax-H3 VAE Decode (Float32 + Live Progress)
         run: |
           TILE_ARGS=""
           if [ "${{ inputs.tile_config }}" = "fast_512" ]; then
