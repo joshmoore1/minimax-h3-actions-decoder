@@ -241,39 +241,98 @@ def decode_latents(
     print(f"[decoder] Decoded video tensor: {video.shape} in {decode_duration:.2f}s ({decode_duration/60:.2f} min)", flush=True)
     print_memory_diagnostics("decoded")
 
-    print("[decoder] Postprocessing video into PIL frames ...", flush=True)
-    vp = VideoProcessor(vae_scale_factor=16, do_normalize=False)
-    frames = vp.postprocess_video(video, output_type="pil")[0]
-    num_frames = len(frames)
-    print(f"[decoder] Total frames generated: {num_frames} ({num_frames / fps:.2f}s)", flush=True)
+    video_np = (video[0].permute(1, 2, 3, 0).float() * 255.0).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    video_bytes = video_np.tobytes()
 
     if output_path is None:
         base_name = os.path.splitext(os.path.basename(latent_path))[0]
         output_path = os.path.join(os.path.dirname(latent_path) or ".", f"{base_name}.mp4")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    base_name = os.path.splitext(output_path)[0]
+    raw_output = f"{base_name}_raw.avi"
+    av1_output = output_path if output_path.endswith(".mp4") else f"{output_path}.mp4"
 
-    print(f"[decoder] Muxing video and audio into {output_path} ...", flush=True)
+    temp_wav = "/tmp/temp_audio.wav"
+    has_audio = False
     if audio is not None:
-        audio = audio.float()
-        print(f"[decoder] Audio shape: {audio.shape}, sample rate: {sampling_rate} Hz", flush=True)
+        from scipy.io import wavfile
+        import numpy as np
+        audio_np = audio.float().cpu().numpy()
+        if audio_np.ndim == 2:
+            audio_np = audio_np.T
+        wavfile.write(temp_wav, sampling_rate, (audio_np * 32767).astype(np.int16))
+        has_audio = True
 
-    encode_video(
-        frames,
-        fps=fps,
-        output_path=output_path,
-        audio=audio,
-        audio_sample_rate=sampling_rate if audio is not None else None,
-    )
+    # Stage 2: Raw Uncompressed Video Export (timed)
+    print("=" * 65, flush=True)
+    print(f"[decoder] Writing Raw Uncompressed Video to {raw_output} ...", flush=True)
+    t_raw_start = time.time()
+    raw_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "-",
+    ]
+    if has_audio:
+        raw_cmd.extend(["-i", temp_wav, "-c:a", "pcm_s16le"])
+    raw_cmd.extend([
+        "-c:v", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-shortest",
+        raw_output,
+    ])
+    p_raw = subprocess.Popen(raw_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    _, err_raw = p_raw.communicate(input=video_bytes)
+    if p_raw.returncode != 0:
+        print(f"[raw-error] {err_raw.decode('utf-8', errors='ignore')}", flush=True)
+    t_raw_export = time.time() - t_raw_start
+    raw_size_mb = os.path.getsize(raw_output) / (1024 * 1024) if os.path.exists(raw_output) else 0
+    print(f"[decoder] Raw Video export completed in {t_raw_export:.2f}s ({raw_size_mb:.2f} MB)", flush=True)
+
+    # Stage 3: Lossless AV1 Video Encoding (timed)
+    print(f"[decoder] Encoding Lossless AV1 Video to {av1_output} ...", flush=True)
+    t_av1_start = time.time()
+    av1_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "-",
+    ]
+    if has_audio:
+        av1_cmd.extend(["-i", temp_wav, "-c:a", "aac", "-b:a", "192k"])
+    av1_cmd.extend([
+        "-c:v", "libaom-av1",
+        "-crf", "0",
+        "-cpu-used", "8",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        av1_output,
+    ])
+    p_av1 = subprocess.Popen(av1_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    _, err_av1 = p_av1.communicate(input=video_bytes)
+    if p_av1.returncode != 0:
+        print(f"[av1-error] {err_av1.decode('utf-8', errors='ignore')}", flush=True)
+    t_av1_encode = time.time() - t_av1_start
+    av1_size_mb = os.path.getsize(av1_output) / (1024 * 1024) if os.path.exists(av1_output) else 0
+    print(f"[decoder] Lossless AV1 encode completed in {t_av1_encode:.2f}s ({av1_size_mb:.2f} MB)", flush=True)
 
     total_duration = time.time() - start_total
-    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print_memory_diagnostics("finished")
     print("=" * 65, flush=True)
-    print(f"[decoder] SUCCESS! Video saved to: {output_path} ({file_size_mb:.2f} MB)")
-    print(f"[decoder] Decode Time: {decode_duration:.2f}s ({decode_duration/60:.2f} min) | Total Elapsed: {total_duration:.2f}s ({total_duration/60:.2f} min)")
+    print("TIMING & PERFORMANCE SUMMARY")
+    print(f"1. VAE Decode Time:           {decode_duration:.2f}s ({decode_duration/60:.2f} min)")
+    print(f"2. Raw Video Export Time:      {t_raw_export:.2f}s ({raw_size_mb:.2f} MB)")
+    print(f"3. Lossless AV1 Encode Time:   {t_av1_encode:.2f}s ({av1_size_mb:.2f} MB)")
+    print(f"Total Execution Time:          {total_duration:.2f}s ({total_duration/60:.2f} min)")
     print("=" * 65, flush=True)
-    return output_path
+    return av1_output
 
 
 def main():
