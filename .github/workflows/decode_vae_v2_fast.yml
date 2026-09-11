@@ -6,19 +6,19 @@ on:
       latent_file:
         description: "Path or filename of the .safetensors latent file in repo"
         required: true
-        default: "real_fox_latents.safetensors"
+        default: "bookstore_latents.safetensors"
       output_name:
         description: "Name for the output MP4 video"
         required: true
-        default: "fox_decoded_bf16.mp4"
+        default: "bookstore_decoded.mp4"
       dtype:
-        description: "Precision (bfloat16 uses AVX-512 hardware acceleration; float32 is legacy)"
+        description: "Precision (float32 is recommended for CPU: 5x faster & pristine quality; bfloat16 causes software emulation & RoPE tearing)"
         required: true
-        default: "bfloat16"
+        default: "float32"
         type: choice
         options:
-          - "bfloat16"
           - "float32"
+          - "bfloat16"
       tile_config:
         description: "Tiling Strategy (Fast 512x512 = ~2 tiles; Single 544x960 = 1 tile; Default 256x256 = ~15 tiles)"
         required: true
