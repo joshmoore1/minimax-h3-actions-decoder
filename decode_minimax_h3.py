@@ -81,17 +81,17 @@ class VAEProgressTracker:
             elapsed = time.time() - self.start_time
             rate = elapsed / self.current_step
             
-            # If total_expected_steps was an underestimate due to tiling, update dynamically
+            # If total_expected_steps was an underestimate, update gracefully without micro-clamping
             if self.current_step > self.total_expected_steps:
-                self.total_expected_steps = self.current_step + self.num_blocks
+                self.total_expected_steps = max(self.total_expected_steps + self.num_blocks, int(self.current_step * 1.05))
 
-            pct = (self.current_step / self.total_expected_steps) * 100.0
-            eta_sec = (self.total_expected_steps - self.current_step) * rate
-            eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60):02d}s" if eta_sec >= 0 else "finishing"
+            pct = min(100.0, (self.current_step / self.total_expected_steps) * 100.0)
+            eta_sec = max(0, (self.total_expected_steps - self.current_step) * rate)
+            eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60):02d}s" if eta_sec > 0 else "finishing"
             rss_mb = self.proc.memory_info().rss / (1024 * 1024)
 
             print(
-                f"[PROGRESS] Step {self.current_step:3d}/{self.total_expected_steps:3d} "
+                f"[PROGRESS] Step {self.current_step:4d}/{self.total_expected_steps:4d} "
                 f"({pct:5.1f}%) | Layer {block_idx+1:2d}/36 | "
                 f"Elapsed: {int(elapsed//60)}m {int(elapsed%60):02d}s | ETA: {eta_str} "
                 f"({rate:4.2f}s/layer) | RSS: {rss_mb:.0f} MB",
@@ -102,6 +102,42 @@ class VAEProgressTracker:
     def remove(self):
         for h in self.hooks:
             h.remove()
+
+
+def print_cpu_hardware_diagnostics():
+    """Detailed CPU architecture and SIMD / AVX vector capability detection."""
+    print("=" * 65, flush=True)
+    print("[hardware] Inspecting CPU Architecture and Vector Capabilities ...", flush=True)
+    model_name = "Unknown"
+    flags = set()
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.startswith("model name") and model_name == "Unknown":
+                    model_name = line.split(":", 1)[1].strip()
+                elif line.startswith("flags"):
+                    flags.update(line.split(":", 1)[1].strip().split())
+    except Exception as e:
+        model_name = f"Error reading /proc/cpuinfo: {e}"
+
+    print(f"[hardware] CPU Model: {model_name}", flush=True)
+    print(f"[hardware] Logical Cores: {os.cpu_count()}", flush=True)
+
+    avx512_flags = [f for f in ["avx512f", "avx512_bf16", "avx512vnni", "avx512vl", "avx512bw", "avx512dq"] if f in flags]
+    has_avx512 = len(avx512_flags) > 0
+    has_avx2 = "avx2" in flags
+    has_fma = "fma" in flags
+
+    print(f"[hardware] AVX2 (256-bit): {'YES' if has_avx2 else 'NO'} | FMA: {'YES' if has_fma else 'NO'}", flush=True)
+    print(f"[hardware] AVX-512 (512-bit): {'YES (' + ', '.join(avx512_flags) + ')' if has_avx512 else 'NO (256-bit registers only)'}", flush=True)
+
+    if "avx512_bf16" in flags:
+        print("[hardware] Optimization Note: Native hardware BF16 dot-product acceleration supported (Zen 4 / Sapphire Rapids)!", flush=True)
+    elif has_avx512:
+        print("[hardware] Optimization Note: AVX-512 foundation present, 512-bit wide FP32 execution.", flush=True)
+    else:
+        print("[hardware] Optimization Note: Running on 256-bit AVX2 architecture (e.g. Zen 3 / Skylake / Milan).", flush=True)
+    print("=" * 65, flush=True)
 
 
 def print_memory_diagnostics(stage: str):
@@ -128,6 +164,7 @@ def decode_latents(
     tile_size: tuple[int, int] | None = None,
 ) -> str:
     start_total = time.time()
+    print_cpu_hardware_diagnostics()
     print_memory_diagnostics("start")
 
     if not os.path.exists(latent_path):
@@ -208,14 +245,26 @@ def decode_latents(
         expected_tiles = ny * nx
         print(f"[decoder] Estimated spatial tiles: {expected_tiles} ({nx} horizontal x {ny} vertical)", flush=True)
 
+    # Estimate 3D temporal chunking (MiniMax-H3 causal 3D VAE chunks ~4-5 latent frames per window)
+    num_latent_t = latents.shape[2]
+    if num_latent_t <= 5:
+        expected_temporal_chunks = 1
+    elif num_latent_t <= 22:
+        expected_temporal_chunks = 2
+    else:
+        expected_temporal_chunks = max(1, round((num_latent_t - 2) / 5.0) + 1)
+
+    expected_total_tiles = expected_tiles * expected_temporal_chunks
+    print(f"[decoder] Estimated 3D volume: {expected_tiles} spatial tiles x ~{expected_temporal_chunks} temporal chunks = ~{expected_total_tiles} spatio-temporal evaluations", flush=True)
+
     # Register real-time forward hook tracker
-    tracker = VAEProgressTracker(vae, num_blocks=len(vae.decoder.transformer_blocks), expected_tiles=expected_tiles)
+    tracker = VAEProgressTracker(vae, num_blocks=len(vae.decoder.transformer_blocks), expected_tiles=expected_total_tiles)
     heartbeat = MemoryHeartbeat(interval_sec=30.0)
     heartbeat.start()
 
     # Denormalize latents
     print("=" * 65, flush=True)
-    print(f"[decoder] Starting decode: 36 layers x {expected_tiles} tiles = ~{tracker.total_expected_steps} total layer evaluations", flush=True)
+    print(f"[decoder] Starting decode: 36 layers x {expected_total_tiles} 3D passes = ~{tracker.total_expected_steps} total layer evaluations", flush=True)
     print("=" * 65, flush=True)
     t_decode = time.time()
 
