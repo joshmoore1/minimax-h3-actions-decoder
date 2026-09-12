@@ -192,54 +192,65 @@ class VAEBlockProfiler:
             h.remove()
 
 
-def benchmark_gemm_throughput():
+def benchmark_gemm_throughput(cpu_flags: set[str] | None = None):
     """Runs a live micro-benchmark measuring PyTorch CPU GEMM throughput across dtypes."""
     print("=" * 65, flush=True)
     print("[benchmark] Measuring Live PyTorch GEMM Throughput on this CPU ...", flush=True)
-    m, k, n = 2048, 2048, 2048
-    flops = 2.0 * m * k * n
-
-    dtypes = [("float32", torch.float32)]
-    # Test bfloat16
-    try:
-        a_bf = torch.randn(m, k, dtype=torch.bfloat16)
-        b_bf = torch.randn(k, n, dtype=torch.bfloat16)
-        _ = torch.matmul(a_bf, b_bf)
-        dtypes.append(("bfloat16", torch.bfloat16))
-    except Exception as e:
-        print(f"[benchmark] bfloat16 not supported in PyTorch matmul: {e}", flush=True)
-
-    # Test float16
-    try:
-        a_f16 = torch.randn(m, k, dtype=torch.float16)
-        b_f16 = torch.randn(k, n, dtype=torch.float16)
-        _ = torch.matmul(a_f16, b_f16)
-        dtypes.append(("float16", torch.float16))
-    except Exception as e:
-        print(f"[benchmark] float16 not supported in PyTorch matmul: {e}", flush=True)
-
     results = {}
-    for name, dt in dtypes:
-        try:
-            a = torch.randn(m, k, dtype=dt)
-            b = torch.randn(k, n, dtype=dt)
-            # Warmup
+    flags = cpu_flags or set()
+    has_native_bf16 = any(f in flags for f in ["avx512_bf16", "amx_bf16", "amx_tile"])
+
+    # 1. Float32 GEMM (native on all modern x86_64)
+    try:
+        m, k, n = 2048, 2048, 2048
+        flops = 2.0 * m * k * n
+        a = torch.randn(m, k, dtype=torch.float32)
+        b = torch.randn(k, n, dtype=torch.float32)
+        _ = torch.matmul(a[:256, :256], b[:256, :256])
+        t0 = time.perf_counter()
+        for _ in range(3):
+            _ = torch.matmul(a, b)
+        dt_sec = (time.perf_counter() - t0) / 3
+        gflops = (flops / 1e9) / dt_sec
+        results["float32"] = {"dt_ms": dt_sec * 1000, "gflops": gflops}
+        print(f"[benchmark] float32  GEMM ({m}x{k}x{n}): {dt_sec*1000:6.1f} ms | Throughput: {gflops:6.2f} GFLOPS", flush=True)
+    except Exception as e:
+        print(f"[benchmark] float32 failed: {e}", flush=True)
+
+    # 2. Bfloat16 GEMM
+    try:
+        if has_native_bf16:
+            m, k, n = 2048, 2048, 2048
+            flops = 2.0 * m * k * n
+            a = torch.randn(m, k, dtype=torch.bfloat16)
+            b = torch.randn(k, n, dtype=torch.bfloat16)
             _ = torch.matmul(a[:256, :256], b[:256, :256])
-            iters = 4
             t0 = time.perf_counter()
-            for _ in range(iters):
-                c = torch.matmul(a, b)
-            dt_sec = (time.perf_counter() - t0) / iters
+            for _ in range(3):
+                _ = torch.matmul(a, b)
+            dt_sec = (time.perf_counter() - t0) / 3
             gflops = (flops / 1e9) / dt_sec
-            results[name] = {"dt_ms": dt_sec * 1000, "gflops": gflops}
-            print(f"[benchmark] {name:8s} GEMM ({m}x{k}x{n}): {dt_sec*1000:6.1f} ms | Throughput: {gflops:6.2f} GFLOPS", flush=True)
-        except Exception as e:
-            print(f"[benchmark] {name:8s} failed: {e}", flush=True)
+            results["bfloat16"] = {"dt_ms": dt_sec * 1000, "gflops": gflops}
+            print(f"[benchmark] bfloat16 GEMM ({m}x{k}x{n}): {dt_sec*1000:6.1f} ms | Throughput: {gflops:6.2f} GFLOPS (Hardware Accelerated)", flush=True)
+        else:
+            m, k, n = 256, 256, 256
+            flops = 2.0 * m * k * n
+            a = torch.randn(m, k, dtype=torch.bfloat16)
+            b = torch.randn(k, n, dtype=torch.bfloat16)
+            t0 = time.perf_counter()
+            _ = torch.matmul(a, b)
+            dt_sec = time.perf_counter() - t0
+            gflops = (flops / 1e9) / max(1e-6, dt_sec)
+            results["bfloat16"] = {"dt_ms": dt_sec * 1000, "gflops": gflops}
+            print(f"[benchmark] bfloat16 GEMM (256x256): {dt_sec*1000:6.1f} ms | Throughput: {gflops:6.2f} GFLOPS [EMULATED - no AVX-512_BF16 / AMX]", flush=True)
+    except Exception as e:
+        print(f"[benchmark] bfloat16 failed: {e}", flush=True)
+
     print("=" * 65, flush=True)
     return results
 
 
-def print_cpu_hardware_diagnostics():
+def print_cpu_hardware_diagnostics() -> tuple[str, set[str]]:
     """Detailed CPU architecture and SIMD / AVX vector capability detection."""
     print("=" * 65, flush=True)
     print("[hardware] Inspecting CPU Architecture and SIMD / Matrix Units ...", flush=True)
@@ -278,6 +289,7 @@ def print_cpu_hardware_diagnostics():
     else:
         print("[hardware] Optimization Tier: C-TIER (256-bit AVX2 architecture, e.g. Zen 3 Milan / Skylake)", flush=True)
     print("=" * 65, flush=True)
+    return model_name, flags
 
 
 def print_memory_diagnostics(stage: str):
@@ -302,10 +314,11 @@ def decode_latents(
     dtype: str = "float32",
     tile: bool = True,
     tile_size: tuple[int, int] | None = None,
+    quantize: str = "none",
 ) -> str:
     start_total = time.time()
-    print_cpu_hardware_diagnostics()
-    gemm_bench = benchmark_gemm_throughput()
+    _, cpu_flags = print_cpu_hardware_diagnostics()
+    gemm_bench = benchmark_gemm_throughput(cpu_flags)
     print_memory_diagnostics("start")
 
     # Threading configuration
@@ -369,6 +382,15 @@ def decode_latents(
     vae.eval()
     print(f"[decoder] VAE loaded in {time.time() - t0:.2f}s", flush=True)
     print_memory_diagnostics("vae_loaded")
+
+    if quantize == "int8":
+        print("[quantization] Applying Dynamic INT8 Quantization (qint8) to Decoder Linear layers ...", flush=True)
+        t_q0 = time.time()
+        vae.decoder = torch.ao.quantization.quantize_dynamic(
+            vae.decoder, {nn.Linear}, dtype=torch.qint8
+        )
+        print(f"[quantization] INT8 Quantization applied in {time.time() - t_q0:.2f}s", flush=True)
+        print_memory_diagnostics("int8_quantized")
 
     # Configure tiling
     expected_tiles = 1
@@ -560,6 +582,7 @@ def decode_latents(
     # Save metrics JSON
     metrics = {
         "precision": dtype,
+        "quantize": quantize,
         "tiling": "disabled" if not tile else (f"{tile_size[0]}x{tile_size[1]}" if tile_size else "default_256"),
         "spatial_tiles": expected_tiles,
         "temporal_chunks": expected_temporal_chunks,
@@ -611,6 +634,7 @@ def record_step_summary(metrics: dict, base_name: str, width: int, height: int, 
 | **Model** | `AutoencoderKLMiniMaxH3 (36-layer 3D-ViT, 2.6B params)` |
 | **Execution Timestamp** | `{timestamp_est}` |
 | **Execution Precision** | `{metrics['precision']}` |
+| **Quantization Scheme** | `{metrics['quantize']}` |
 | **Tiling Strategy** | `{metrics['tiling']}` ({metrics['spatial_tiles']} spatial x {metrics['temporal_chunks']} temporal = {metrics['spatial_tiles']*metrics['temporal_chunks']} passes) |
 | **Target Dimensions** | {width}x{height} @ {fps} fps ({frames} latent frames) |
 | **Hardware GEMM Throughput** | {gemm_str} |
@@ -640,8 +664,9 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="Output MP4 file path")
     parser.add_argument("--device", default=None, help="Device to use (cuda or cpu)")
     parser.add_argument("--dtype", default="float32", choices=["float16", "bfloat16", "float32"], help="Precision")
+    parser.add_argument("--quantize", default="none", choices=["none", "int8"], help="Dynamic quantization scheme (none or int8)")
     parser.add_argument("--no-tile", action="store_true", help="Disable spatial tiling (single monolithic pass)")
-    parser.add_argument("--tile-size", nargs=2, type=int, default=None, metavar=("HEIGHT", "WIDTH"), help="Custom tile size (e.g. 512 512 or 384 384)")
+    parser.add_argument("--tile-size", nargs=2, type=int, default=None, metavar=("HEIGHT", "WIDTH"), help="Custom tile size (e.g. 512 512, 416 320, or 384 288)")
 
     args = parser.parse_args()
     tile_size = tuple(args.tile_size) if args.tile_size is not None else None
@@ -653,6 +678,7 @@ def main():
         dtype=args.dtype,
         tile=not args.no_tile,
         tile_size=tile_size,
+        quantize=args.quantize,
     )
 
 

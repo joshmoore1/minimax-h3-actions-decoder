@@ -23,25 +23,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "FP32_Fast512 (4 tiles)"
-            dtype: "float32"
-            tile_args: "--tile-size 512 512"
-            tag: "fp32_fast512"
-
-          - name: "FP32_NoTile_Monolithic (1 tile)"
-            dtype: "float32"
-            tile_args: "--no-tile"
-            tag: "fp32_notile"
-
-          - name: "FP32_Default256_Baseline (12 tiles)"
-            dtype: "float32"
-            tile_args: ""
-            tag: "fp32_default256"
-
-          - name: "BF16_Fast512 (Precision Test)"
+          - name: "BF16_NoTile (Speed Record Test)"
             dtype: "bfloat16"
-            tile_args: "--tile-size 512 512"
-            tag: "bf16_fast512"
+            extra_args: "--no-tile"
+            tag: "bf16_notile"
+
+          - name: "FP32_Optimal_416x320 (Aspect-Ratio 4-Tile)"
+            dtype: "float32"
+            extra_args: "--tile-size 416 320"
+            tag: "fp32_opt416"
+
+          - name: "INT8_NoTile (Quantization Quality & Speed)"
+            dtype: "float32"
+            extra_args: "--quantize int8 --no-tile"
+            tag: "int8_notile"
+
+          - name: "INT8_Optimal_416x320 (Quantized + Optimal Aspect)"
+            dtype: "float32"
+            extra_args: "--quantize int8 --tile-size 416 320"
+            tag: "int8_opt416"
 
     steps:
       - name: Checkout Repository
@@ -98,13 +98,13 @@ jobs:
           
           OUTPUT_NAME="recordshop_${{ matrix.tag }}.mp4"
           
-          echo "Executing: python decode_minimax_h3.py $LATENT_FILE --device cpu --dtype ${{ matrix.dtype }} --output $OUTPUT_NAME ${{ matrix.tile_args }}"
+          echo "Executing: python decode_minimax_h3.py $LATENT_FILE --device cpu --dtype ${{ matrix.dtype }} --output $OUTPUT_NAME ${{ matrix.extra_args }}"
           
           python decode_minimax_h3.py "$LATENT_FILE" \
             --device cpu \
             --dtype "${{ matrix.dtype }}" \
             --output "$OUTPUT_NAME" \
-            ${{ matrix.tile_args }}
+            ${{ matrix.extra_args }}
 
       - name: Upload Video Artifact
         uses: actions/upload-artifact@v4
