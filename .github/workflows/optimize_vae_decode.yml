@@ -7,10 +7,6 @@ on:
         description: "Latent safetensors file to decode"
         required: true
         default: "recordshop_576x768_56f_n3_latents.safetensors"
-  push:
-    paths:
-      - ".github/workflows/optimize_vae_decode.yml"
-      - "decode_minimax_h3.py"
 
 env:
   PYTHONUNBUFFERED: "1"
