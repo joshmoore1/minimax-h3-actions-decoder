@@ -1,0 +1,130 @@
+name: Optimize VAE Decode Benchmark Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      latent_file:
+        description: "Latent safetensors file to decode"
+        required: true
+        default: "recordshop_576x768_56f_n3_latents.safetensors"
+  push:
+    paths:
+      - ".github/workflows/optimize_vae_decode.yml"
+      - "decode_minimax_h3.py"
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  KMP_BLOCKTIME: "1"
+
+jobs:
+  benchmark_matrix:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "FP32_Fast512 (4 tiles)"
+            dtype: "float32"
+            tile_args: "--tile-size 512 512"
+            tag: "fp32_fast512"
+
+          - name: "FP32_NoTile_Monolithic (1 tile)"
+            dtype: "float32"
+            tile_args: "--no-tile"
+            tag: "fp32_notile"
+
+          - name: "FP32_Default256_Baseline (12 tiles)"
+            dtype: "float32"
+            tile_args: ""
+            tag: "fp32_default256"
+
+          - name: "BF16_Fast512 (Precision Test)"
+            dtype: "bfloat16"
+            tile_args: "--tile-size 512 512"
+            tag: "bf16_fast512"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Runner Diagnostics & Hardware Probing
+        run: |
+          echo "================================================================="
+          echo "GITHUB ACTIONS RUNNER HARDWARE AUDIT"
+          echo "================================================================="
+          lscpu | grep -E "Model name|CPU\(s\):|Thread|Core|Socket|BogoMIPS|L1|L2|L3" || true
+          echo ""
+          echo "--- SIMD & Vector Instruction Flags ---"
+          grep -m1 "^flags" /proc/cpuinfo | tr ' ' '\n' | grep -E "^(avx|fma|amx|sse4)" | sort -u | tr '\n' ' '
+          echo ""
+          echo ""
+          echo "--- Memory & Swap Hierarchy ---"
+          free -h
+          echo "================================================================="
+
+      - name: Allocate 8GB Safety Swapfile
+        run: |
+          sudo fallocate -l 8G /swapfile2 || sudo dd if=/dev/zero of=/swapfile2 bs=1M count=8192
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2
+          sudo swapon /swapfile2
+          free -h
+
+      - name: Install System Dependencies & Jemalloc
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg libjemalloc2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install CPU PyTorch & Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Run MiniMax-H3 VAE Decode Benchmark
+        env:
+          LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+        run: |
+          LATENT_FILE="${{ inputs.latent_file }}"
+          if [ -z "$LATENT_FILE" ]; then
+            LATENT_FILE="recordshop_576x768_56f_n3_latents.safetensors"
+          fi
+          
+          OUTPUT_NAME="recordshop_${{ matrix.tag }}.mp4"
+          
+          echo "Executing: python decode_minimax_h3.py $LATENT_FILE --device cpu --dtype ${{ matrix.dtype }} --output $OUTPUT_NAME ${{ matrix.tile_args }}"
+          
+          python decode_minimax_h3.py "$LATENT_FILE" \
+            --device cpu \
+            --dtype "${{ matrix.dtype }}" \
+            --output "$OUTPUT_NAME" \
+            ${{ matrix.tile_args }}
+
+      - name: Upload Video Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: video-${{ matrix.tag }}
+          path: |
+            recordshop_${{ matrix.tag }}.mp4
+            recordshop_${{ matrix.tag }}_raw.avi
+          retention-days: 14
+
+      - name: Upload Telemetry & Metrics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: telemetry-${{ matrix.tag }}
+          path: |
+            recordshop_${{ matrix.tag }}_metrics.json
+          retention-days: 14

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.mp4
+*.avi
+*.wav
+*_metrics.json
+.pytest_cache/

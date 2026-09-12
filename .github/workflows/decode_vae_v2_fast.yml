@@ -6,13 +6,13 @@ on:
       latent_file:
         description: "Path or filename of the .safetensors latent file in repo"
         required: true
-        default: "bookstore_latents.safetensors"
+        default: "recordshop_576x768_56f_n3_latents.safetensors"
       output_name:
         description: "Name for the output MP4 video"
         required: true
-        default: "bookstore_decoded.mp4"
+        default: "recordshop_decoded.mp4"
       dtype:
-        description: "Precision (float32 is recommended for CPU: 5x faster & pristine quality; bfloat16 causes software emulation & RoPE tearing)"
+        description: "Precision (float32 is recommended for CPU: pristine quality; bfloat16 for hardware AVX-512_BF16)"
         required: true
         default: "float32"
         type: choice
@@ -20,15 +20,14 @@ on:
           - "float32"
           - "bfloat16"
       tile_config:
-        description: "Tiling Strategy (Fast 512x512 = ~2 tiles; Single 544x960 = 1 tile; Default 256x256 = ~15 tiles)"
+        description: "Tiling Strategy (Fast 512x512 = 4 tiles; No Tile / Monolithic = 1 tile; Default 256x256 = 12 tiles)"
         required: true
         default: "fast_512"
         type: choice
         options:
           - "fast_512"
-          - "single_tile"
-          - "default_256"
           - "no_tile"
+          - "default_256"
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -81,8 +80,6 @@ jobs:
           TILE_ARGS=""
           if [ "${{ inputs.tile_config }}" = "fast_512" ]; then
             TILE_ARGS="--tile-size 512 512"
-          elif [ "${{ inputs.tile_config }}" = "single_tile" ]; then
-            TILE_ARGS="--tile-size 544 960"
           elif [ "${{ inputs.tile_config }}" = "no_tile" ]; then
             TILE_ARGS="--no-tile"
           fi
