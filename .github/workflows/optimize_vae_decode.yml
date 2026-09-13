@@ -23,25 +23,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "BF16_NoTile (Speed Record Test)"
+          - name: "Pristine_Auto_Batched_B4 (Universal Intelligent Adaptive)"
+            dtype: "auto"
+            extra_args: "--tile-batch-size 4"
+            tag: "pristine_auto_b4"
+
+          - name: "Pristine_FP32_Batched_B4 (Vectorized Tile Batching)"
+            dtype: "float32"
+            extra_args: "--tile-batch-size 4"
+            tag: "pristine_fp32_b4"
+
+          - name: "Pristine_INT8_Batched_B4 (Quantized VNNI + Batched)"
+            dtype: "float32"
+            extra_args: "--quantize int8 --tile-batch-size 4"
+            tag: "pristine_int8_b4"
+
+          - name: "Pristine_AMX_Hunter_BF16 (Dedicated AMX Tile Batching)"
             dtype: "bfloat16"
-            extra_args: "--no-tile"
-            tag: "bf16_notile"
-
-          - name: "FP32_Optimal_416x320 (Aspect-Ratio 4-Tile)"
-            dtype: "float32"
-            extra_args: "--tile-size 416 320"
-            tag: "fp32_opt416"
-
-          - name: "INT8_NoTile (Quantization Quality & Speed)"
-            dtype: "float32"
-            extra_args: "--quantize int8 --no-tile"
-            tag: "int8_notile"
-
-          - name: "INT8_Optimal_416x320 (Quantized + Optimal Aspect)"
-            dtype: "float32"
-            extra_args: "--quantize int8 --tile-size 416 320"
-            tag: "int8_opt416"
+            extra_args: "--tile-batch-size 4"
+            tag: "pristine_amx_b4"
 
     steps:
       - name: Checkout Repository
@@ -91,6 +91,14 @@ jobs:
         env:
           LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
         run: |
+          if [ "${{ matrix.tag }}" = "pristine_amx_b4" ]; then
+            if ! grep -q "amx_tile" /proc/cpuinfo; then
+              echo "Runner CPU is not Intel AMX (Granite/Emerald Rapids). Yielding runner early."
+              exit 0
+            fi
+            echo "AMX Hardware Confirmed! Proceeding with Emerald/Granite Rapids BF16 benchmark."
+          fi
+
           LATENT_FILE="${{ inputs.latent_file }}"
           if [ -z "$LATENT_FILE" ]; then
             LATENT_FILE="recordshop_576x768_56f_n3_latents.safetensors"
